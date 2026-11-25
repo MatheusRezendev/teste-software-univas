@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterAll } from 'vitest'
 import request from 'supertest'
 import app from '../../src/app'
-import { prisma, resetDb } from './helpers/db'
+import { prisma, resetDb, seedUserAndCategory } from './helpers/db'
 
 // Exemplo de referência (escrito à mão) para a aula de testes de integração.
 // Contrato API01 (docs/especificacao.md): POST /api/users.
@@ -44,5 +44,36 @@ describe('POST /api/users (API01)', () => {
     expect(res.status).toBe(409)
     expect(res.body.success).toBe(false)
     expect(await prisma.user.count()).toBe(1)
+  })
+})
+
+// Contrato API02: GET /api/users. Caso criado após a sabotagem S3 (remover o
+// include de tasks em getUsers) não ser detectada por nenhum teste.
+describe('GET /api/users (API02)', () => {
+  beforeEach(async () => {
+    await resetDb()
+  })
+
+  afterAll(async () => {
+    await prisma.$disconnect()
+  })
+
+  it('responde 200 com count e cada usuário com sua lista tasks (vazia quando não há tarefas)', async () => {
+    // Arrange: Ana com uma tarefa, Bruno sem tarefas
+    const { user: ana, category } = await seedUserAndCategory()
+    await prisma.task.create({ data: { title: 'Prova', userId: ana.id, categoryId: category.id } })
+    await prisma.user.create({ data: { name: 'Bruno Lima', email: 'bruno@email.com' } })
+
+    // Act
+    const res = await request(app).get('/api/users')
+
+    // Assert
+    expect(res.status).toBe(200)
+    expect(res.body.success).toBe(true)
+    expect(res.body.count).toBe(2)
+    const porEmail = Object.fromEntries(res.body.data.map((u: { email: string }) => [u.email, u]))
+    expect(porEmail['ana@email.com'].tasks).toHaveLength(1)
+    expect(porEmail['ana@email.com'].tasks[0].title).toBe('Prova')
+    expect(porEmail['bruno@email.com'].tasks).toEqual([])
   })
 })

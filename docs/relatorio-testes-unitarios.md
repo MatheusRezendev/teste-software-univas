@@ -85,3 +85,101 @@ nenhum resultado observável, logo são **mutantes equivalentes** e nenhum caso 
 | Regra | Comportamento especificado | Comportamento observado | Teste que evidencia |
 |-------|----------------------------|-------------------------|---------------------|
 | RN01 | `PENDING → CANCELLED` é permitido ("uma tarefa pendente pode ser cancelada antes de ser iniciada") | `canTransition('PENDING', 'CANCELLED')` retorna `false` | `taskRules.test.ts` › `it.fails('permite cancelar uma tarefa pendente (PENDING -> CANCELLED)')` |
+
+---
+
+# Parte 2 — Testes de integração com IA generativa
+
+**Unidades testadas:** backend API03, API04 e API05 (+ API02, caso criado pela sabotagem);
+frontend RF08 e RF09 (componente `Users`).
+
+## 1. Tabela de casos (a partir de `docs/especificacao.md`)
+
+### Backend (Supertest + PostgreSQL de teste `teste_software_test_db`)
+
+| # | Estado inicial | Requisição | Resposta esperada | Efeito no banco | Regra |
+|---|----------------|------------|-------------------|-----------------|-------|
+| 1 | categoria sem tarefas | `DELETE /api/categories/:id` | 200 | categoria removida | API03 |
+| 2 | categoria com 1 tarefa (valor-limite) | `DELETE /api/categories/:id` | 400 | categoria e tarefa mantidas | API03 / RN02 |
+| 3 | 1 categoria qualquer | `DELETE /api/categories/inexistente` | 404 | nenhum (count = 1) | API03 |
+| 4 | banco vazio | `POST /api/categories` `{name:"Estudo"}` | 201 | categoria criada (count = 1) | API04 |
+| 5 | existe `trabalho` | `POST` `{name:"Estudo"}` | 201 | count = 2 | API04 |
+| 6 | existe `trabalho` | `POST` `{name:"trabalho"}` | 409 | nenhuma criada (count = 1) | API04 |
+| 7 | existe `" trabalho "` | `POST` `{name:"Trabalho"}` | 409 | nenhuma criada (count = 1) | API04 / RN03 |
+| 8 | existe `trabalho da faculdade` | `POST` `{name:"  Trabalho   da\tFaculdade "}` | 409 | nenhuma criada (count = 1) | API04 / RN03 |
+| 9–12 | tarefa em `PENDING`, `IN_PROGRESS`, `IN_PROGRESS`, `PENDING` | `PUT /api/tasks/:id` com `IN_PROGRESS`, `COMPLETED`, `CANCELLED`, `CANCELLED` | 200 | novo status gravado | API05 / RN01 |
+| 13–16 | tarefa em `COMPLETED`, `CANCELLED`, `PENDING`, `IN_PROGRESS` | `PUT` com `PENDING`, `IN_PROGRESS`, `COMPLETED`, `PENDING` | 400 | tarefa inalterada (status e `updatedAt`) | API05 / RN04 |
+| 17 | banco vazio | `PUT /api/tasks/inexistente` | 404 | nenhum | API05 |
+| 18 | Ana com 1 tarefa, Bruno sem tarefas | `GET /api/users` | 200, `count` 2, `tasks` com 1 item / `[]` | nenhum | API02 (novo, sabotagem S3) |
+
+### Frontend (Testing Library + MSW)
+
+| # | Estado inicial (handler MSW) | Ação do usuário | Resultado esperado | Requisição verificada | Regra |
+|---|------------------------------|-----------------|--------------------|-----------------------|-------|
+| 1 | `GET` vazio; após `POST` (201) passa a devolver o novo usuário | Adicionar Usuário → Nome, Email → Criar | formulário fechado; lista recarregada mostra o usuário | corpo do `POST` = `{name, email}` digitados | RF08 / API01 |
+| 2 | `POST` responde 409 | idem | mensagem "Email já cadastrado" | — | RF09 |
+| 3 | `POST` responde 409 | idem | formulário aberto com Nome e Email preenchidos | — | RF09 |
+
+## 2. Prompts utilizados
+
+```
+Contexto: rotas DELETE /api/categories/:id, POST /api/categories e PUT /api/tasks/:id,
+contratos API03, API04 e API05 e regras RN01–RN04 de docs/especificacao.md.
+Tarefa: escreva testes de integração em backend/tests/integration/categories.int.test.ts
+e backend/tests/integration/tasks.int.test.ts.
+Casos obrigatórios (definidos por mim): tabela "Backend" da seção 1 (casos 1–17).
+Restrições: siga o AGENTS.md (seção Testes de integração). Use request(app) e os helpers
+de helpers/db.ts. Não use vi.mock. Não altere src/.
+Saída: execute npm run test:integration e relacione cada teste a uma linha da tabela.
+```
+
+```
+Contexto: componente Users (frontend/src/components/Users.tsx), requisitos RF08 e RF09
+e contrato API01 de docs/especificacao.md.
+Tarefa: escreva testes de integração em frontend/tests/integration/Users.create.int.test.tsx.
+Casos obrigatórios (definidos por mim): tabela "Frontend" da seção 1.
+Restrições: siga o AGENTS.md (seção Testes de integração). Simule a API com MSW no
+formato do contrato ({ success, data }); não use vi.spyOn(api). Verifique o corpo do POST.
+Não altere src/.
+Saída: execute npm run test:integration e relacione cada teste a uma linha da tabela.
+```
+
+## 3. Revisão do teste gerado
+
+| Problema encontrado no teste gerado | Ajuste solicitado ou realizado |
+|-------------------------------------|--------------------------------|
+| Frontend: `getByLabelText('Nome')` não encontrava o campo, pois o rótulo é `"Nome:"` (com dois-pontos). | Localizador trocado por `/^nome/i` e `/^email/i`. Só o localizador mudou, nenhuma asserção. |
+| Frontend: sem `globals` no Vitest, o Testing Library não desmontava o componente entre testes e o render do RF08 vazava para o RF09. | `afterEach(() => cleanup())` no arquivo de teste. |
+| Frontend: o teste do RF09 verificava mensagem e formulário juntos; com a mensagem errada (defeito), a verificação do formulário nem rodava. | Separado em dois testes: mensagem (`it.fails`) e formulário aberto (passa). O segundo espera a tela reagir ao 409 antes de verificar, para não passar antes da resposta. |
+| Backend: `PENDING → CANCELLED` foi escrito como `it.fails` supondo o defeito da unidade `canTransition`, mas a API não aplica a RN01 e aceitou a transição. | Movido para a tabela de transições aceitas (teste normal). Defeito real registrado na seção 5. |
+| Frontend: o handler de 409 do MSW poderia ter a mensagem da especificação no corpo e esconder o defeito do RF09. | Corpo do 409 usa uma mensagem neutra (`email already registered`) no formato do contrato, para que só o componente produza "Email já cadastrado". |
+| Teste novo de API02 falhou sem sabotagem (`seedUserAndCategory` não importado). | Import corrigido; reexecutado sem sabotagem (passa) e com S3 (falha). |
+
+## 4. Resultados
+
+- Backend (`npm run test:integration`): 20 testes, 12 aprovados, 8 falhas esperadas (`it.fails`), 0 reprovados.
+- Frontend (`npm run test:integration`): 4 testes, 3 aprovados, 1 falha esperada (`it.fails`), 0 reprovados.
+- Testes unitários do backend continuam passando (`npm test`: 32 aprovados, 1 falha esperada).
+
+### Sabotagem controlada (uma por vez, desfeita com `git restore src/`)
+
+| # | Sabotagem | Arquivo | Regra | Detectada? | Teste que falhou |
+|---|-----------|---------|-------|------------|------------------|
+| S1 | Remover a checagem `canDeleteCategory` | `categoryController.ts` | API03 | Sim | `recusa excluir uma categoria com uma tarefa, responde 400 e mantém categoria e tarefa` |
+| S2 | Trocar 409 por 400 | `userController.ts` | API01 | Sim | `responde 409 ao repetir um email já cadastrado` |
+| S3 | Remover `include: { tasks }` de `getUsers` | `userController.ts` | API02 | **Não** na 1ª rodada → novo caso 18. Sim após o caso novo | `GET /api/users (API02) › responde 200 com count e cada usuário com sua lista tasks` |
+| S4 | Remover `fetchUsers()` após salvar | `Users.tsx` | RF08 | Sim | `envia os dados digitados, fecha o formulário e exibe o novo usuário na lista recarregada (RF08)` |
+
+## 5. Defeitos encontrados (divergências entre especificação e código)
+
+| Regra | Comportamento especificado | Comportamento observado | Teste que evidencia |
+|-------|----------------------------|-------------------------|---------------------|
+| API03 | Categoria inexistente: `404` | `500` | `categories.int.test.ts` › `it.fails('responde 404 para uma categoria inexistente')` |
+| API04 / RN03 | Nome que coincide após normalização: `409`, nenhuma categoria criada | `201` e categoria duplicada gravada (só nomes idênticos dão 409) | `categories.int.test.ts` › `it.fails.each(... nome normalizado já existe ...)` (2 casos) |
+| API05 / RN04 | Transição proibida pela RN01: `400`, tarefa inalterada | `200` e o novo status é gravado (ex.: `COMPLETED → PENDING`) | `tasks.int.test.ts` › `it.fails.each('recusa $de -> $para ...')` (4 casos) |
+| API05 | Tarefa inexistente: `404` | `500` | `tasks.int.test.ts` › `it.fails('responde 404 para uma tarefa inexistente')` |
+| RF09 | 409 ao criar usuário exibe "Email já cadastrado" | exibe "Erro ao salvar usuário" | `Users.create.int.test.tsx` › `it.fails('exibe a mensagem "Email já cadastrado"')` |
+
+Observação: na API, `PENDING → CANCELLED` é aceito (como a especificação manda), ao contrário da
+unidade `canTransition`. Pelo comportamento observado, a API não aplica a RN01, o que esconde esse defeito da unidade e
+expõe o defeito mais grave da RN04.
